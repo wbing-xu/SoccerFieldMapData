@@ -439,8 +439,17 @@ def _extract_ld_json(html: str) -> List[Dict[str, object]]:
 
 def _extract_field_from_page(url: str, html: str) -> Optional[Dict[str, object]]:
     ld_blocks = _extract_ld_json(html)
+    desired_types = {"Place", "LocalBusiness", "SportsActivityLocation"}
+
+    def _matches_schema_type(value: object) -> bool:
+        if isinstance(value, str):
+            return value in desired_types
+        if isinstance(value, list):
+            return any(isinstance(item, str) and item in desired_types for item in value)
+        return False
+
     for block in ld_blocks:
-        if block.get("@type") in {"Place", "LocalBusiness", "SportsActivityLocation"}:
+        if _matches_schema_type(block.get("@type")):
             name = block.get("name") or block.get("headline") or ""
             address = block.get("address") or block.get("streetAddress") or ""
             if isinstance(address, dict):
