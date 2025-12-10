@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import json
 import logging
 import random
 import re
@@ -23,6 +24,7 @@ from typing import Dict, Iterable, List, Optional
 import requests
 
 LISTING_URL = "https://www.soccerfieldmap.com/api/fields"
+EXPLORE_URL = "https://www.soccerfieldmap.com/explore"
 WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
 DEFAULT_USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -206,6 +208,53 @@ def fetch_listing(client: HttpClient, page: int, page_size: int) -> List[Dict[st
     raise ValueError("Unexpected listing payload structure")
 
 
+def _iter_matching_lists(obj: object) -> Iterable[List[object]]:
+    if isinstance(obj, list):
+        yield obj
+        for item in obj:
+            yield from _iter_matching_lists(item)
+    elif isinstance(obj, dict):
+        for value in obj.values():
+            yield from _iter_matching_lists(value)
+
+
+def _looks_like_field(record: object) -> bool:
+    if not isinstance(record, dict):
+        return False
+    has_name = bool(record.get("name"))
+    has_address = bool(record.get("address") or record.get("location"))
+    has_id = any(record.get(key) is not None for key in ("id", "uuid", "_id"))
+    return has_name and has_address and has_id
+
+
+def bootstrap_from_explore(client: HttpClient) -> List[Dict[str, object]]:
+    logging.warning(
+        "Primary listing endpoint returned nothing; attempting to bootstrap from %s",
+        EXPLORE_URL,
+    )
+    response = client.get(EXPLORE_URL)
+    html = response.text
+    start_tag = '<script id="__NEXT_DATA__" type="application/json">'
+    start_idx = html.find(start_tag)
+    if start_idx == -1:
+        raise ValueError("Unable to locate NEXT_DATA script on explore page")
+    start_idx += len(start_tag)
+    end_idx = html.find("</script>", start_idx)
+    if end_idx == -1:
+        raise ValueError("Unable to parse NEXT_DATA script contents")
+    payload_raw = html[start_idx:end_idx]
+    try:
+        payload = json.loads(payload_raw)
+    except json.JSONDecodeError as exc:  # noqa: BLE001
+        raise ValueError("Explore page NEXT_DATA JSON is malformed") from exc
+
+    for candidate_list in _iter_matching_lists(payload):
+        if len(candidate_list) > 100 and all(_looks_like_field(item) for item in candidate_list):
+            logging.info("Found %s candidate fields in explore bootstrap", len(candidate_list))
+            return [item for item in candidate_list if isinstance(item, dict)]
+    raise ValueError("No candidate field list discovered in explore bootstrap")
+
+
 def infer_field(record: Dict[str, object]) -> Field:
     external_id = str(record.get("id") or record.get("uuid") or record.get("_id"))
     name = str(record.get("name") or "").strip()
@@ -335,6 +384,7 @@ def enrich_with_wikipedia(client: HttpClient, field: Field) -> Field:
 
 def iter_fields(client: HttpClient, start_page: int, page_size: int) -> Iterable[List[Dict[str, object]]]:
     page = start_page
+    attempted_bootstrap = False
     while True:
         try:
             batch = fetch_listing(client, page, page_size)
@@ -342,6 +392,20 @@ def iter_fields(client: HttpClient, start_page: int, page_size: int) -> Iterable
             logging.error("Failed to fetch listing page %s: %s", page, exc)
             raise
         if not batch:
+            if page == start_page and not attempted_bootstrap:
+                attempted_bootstrap = True
+                try:
+                    bootstrap = bootstrap_from_explore(client)
+                except Exception as exc:  # noqa: BLE001 - we want to bubble after logging
+                    logging.error("Explore bootstrap failed: %s", exc)
+                    break
+                if not bootstrap:
+                    break
+                logging.info("Yielding explore bootstrap data in %s-sized chunks", page_size)
+                for idx in range(0, len(bootstrap), page_size):
+                    yield bootstrap[idx : idx + page_size]
+                    page += 1
+                break
             break
         yield batch
         page += 1
