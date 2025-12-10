@@ -425,6 +425,37 @@ def _extract_field_from_page(url: str, html: str) -> Optional[Dict[str, object]]
                     "lat": block.get("geo", {}).get("latitude") if isinstance(block.get("geo"), dict) else None,
                     "lng": block.get("geo", {}).get("longitude") if isinstance(block.get("geo"), dict) else None,
                 }
+
+    # Fallback: parse __NEXT_DATA__ and hunt for a dict that looks like a field record.
+    try:
+        payload = _extract_next_data(html)
+    except Exception:  # noqa: BLE001 - treat as absence and continue
+        payload = None
+
+    def _iter_dicts(obj: object) -> Iterable[Dict[str, object]]:
+        if isinstance(obj, dict):
+            yield obj
+            for value in obj.values():
+                yield from _iter_dicts(value)
+        elif isinstance(obj, list):
+            for item in obj:
+                yield from _iter_dicts(item)
+
+    if payload:
+        for candidate in _iter_dicts(payload):
+            if _looks_like_field(candidate):
+                name = str(candidate.get("name") or "").strip()
+                address = str(candidate.get("address") or candidate.get("location") or "").strip()
+                if name and address:
+                    return {
+                        "id": candidate.get("id") or candidate.get("uuid") or url.rstrip("/").split("/")[-1],
+                        "url": url,
+                        "name": name,
+                        "address": address,
+                        "lat": candidate.get("lat") or candidate.get("latitude"),
+                        "lng": candidate.get("lng") or candidate.get("longitude"),
+                    }
+
     return None
 
 
