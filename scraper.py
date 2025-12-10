@@ -271,15 +271,25 @@ def bootstrap_from_explore(client: HttpClient) -> List[Dict[str, object]]:
     )
     response = client.get(EXPLORE_URL)
     html = response.text
-    start_tag = '<script id="__NEXT_DATA__" type="application/json">'
-    start_idx = html.find(start_tag)
-    if start_idx == -1:
-        raise ValueError("Unable to locate NEXT_DATA script on explore page")
-    start_idx += len(start_tag)
-    end_idx = html.find("</script>", start_idx)
-    if end_idx == -1:
-        raise ValueError("Unable to parse NEXT_DATA script contents")
-    payload_raw = html[start_idx:end_idx]
+
+    match = re.search(
+        r"<script[^>]*id=\"__NEXT_DATA__\"[^>]*>(?P<body>.*?)</script>",
+        html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        inline_match = re.search(
+            r"__NEXT_DATA__\s*=\s*(?P<body>\{.*?\})\s*[;\n]",
+            html,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if inline_match:
+            match = inline_match
+
+    if not match:
+        raise ValueError("Unable to locate NEXT_DATA payload on explore page")
+
+    payload_raw = match.group("body")
     try:
         payload = json.loads(payload_raw)
     except json.JSONDecodeError as exc:  # noqa: BLE001
