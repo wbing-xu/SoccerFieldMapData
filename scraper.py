@@ -303,13 +303,62 @@ def _extract_next_data(html: str) -> Dict[str, object]:
     raise ValueError(f"Unable to locate NEXT_DATA payload on explore page (snippet: {snippet[:120]}...)")
 
 
+def _extract_build_id(payload: Dict[str, object]) -> Optional[str]:
+    """Pull the Next.js buildId out of a decoded __NEXT_DATA__ payload."""
+
+    if not isinstance(payload, dict):
+        return None
+    build_id = payload.get("buildId")
+    if isinstance(build_id, str) and build_id:
+        return build_id
+    return None
+
+
+def _fetch_next_data_json(client: HttpClient, path: str, build_id: str) -> Optional[Dict[str, object]]:
+    url = f"https://www.soccerfieldmap.com/_next/data/{build_id}{path}.json"
+    try:
+        response = client.get(url, allow_statuses={403, 404})
+    except Exception as exc:  # noqa: BLE001 - continue to fallbacks
+        logging.warning("Failed to fetch _next data %s: %s", url, exc)
+        return None
+    if response.status_code >= 400:
+        logging.warning("_next data endpoint returned %s for %s", response.status_code, url)
+        return None
+    try:
+        return response.json()
+    except Exception as exc:  # noqa: BLE001 - continue to fallbacks
+        logging.warning("Failed to decode _next data %s: %s", url, exc)
+        return None
+
+
 def bootstrap_from_explore(client: HttpClient) -> List[Dict[str, object]]:
     logging.warning(
         "Primary listing endpoint returned nothing; attempting to bootstrap from %s",
         EXPLORE_URL,
     )
     response = client.get(EXPLORE_URL, allow_statuses={403})
-    payload = _extract_next_data(response.text)
+    try:
+        payload = _extract_next_data(response.text)
+    except Exception as exc:  # noqa: BLE001 - try alternate pathways
+        logging.warning("Explore page missing NEXT_DATA (%s); falling back to _next data", exc)
+        payload = None
+
+    build_id = _extract_build_id(payload) if payload else None
+    if not build_id:
+        try:
+            home_payload = _extract_next_data(client.get("https://www.soccerfieldmap.com/", allow_statuses={403}).text)
+            build_id = _extract_build_id(home_payload)
+        except Exception as exc:  # noqa: BLE001 - keep trying without crash
+            logging.warning("Unable to read buildId from homepage: %s", exc)
+
+    if build_id:
+        logging.info("Attempting _next data fetch using buildId %s", build_id)
+        next_payload = _fetch_next_data_json(client, "/explore", build_id)
+        if isinstance(next_payload, dict):
+            payload = next_payload.get("pageProps") or next_payload
+
+    if not payload:
+        raise ValueError("No explore payload available from HTML or _next data")
 
     for candidate_list in _iter_matching_lists(payload):
         if len(candidate_list) > 100 and all(_looks_like_field(item) for item in candidate_list):
