@@ -662,9 +662,9 @@ def bootstrap_from_sitemap(client: HttpClient, limit: Optional[int] = None) -> L
 
 
 def collect_field_urls(client: HttpClient) -> List[str]:
-    """Collect field links prioritizing the explore page states -> sitemap -> listing API."""
+    """Collect field links by merging explore-page crawl, sitemap, and listing API."""
 
-    urls: List[str] = []
+    urls: list[str] = []
 
     # 1) Crawl explore page (STATE -> FIELDS) to mirror manual clicks.
     links = bootstrap_from_explore_links(client)
@@ -672,37 +672,40 @@ def collect_field_urls(client: HttpClient) -> List[str]:
     if urls:
         logging.info("Discovered %s field links from explore page crawl", len(urls))
 
-    # 2) Sitemap fallback if explore did not yield anything.
-    if not urls:
-        try:
-            response = client.get(SITEMAP_URL, allow_statuses={403, 404})
-            if response.status_code < 400:
-                sitemap_urls = re.findall(r"<loc>(.*?)</loc>", response.text)
-                urls.extend([u for u in sitemap_urls if "/field/" in u])
-                if urls:
-                    logging.info("Discovered %s field links from sitemap", len(urls))
-        except Exception as exc:  # noqa: BLE001 - continue to other fallbacks
-            logging.warning("Sitemap URL crawl failed: %s", exc)
+    # 2) Always merge sitemap URLs so missing explore links are recovered.
+    try:
+        response = client.get(SITEMAP_URL, allow_statuses={403, 404})
+        if response.status_code < 400:
+            sitemap_urls = re.findall(r"<loc>(.*?)</loc>", response.text)
+            added = [u for u in sitemap_urls if "/field/" in u]
+            before = len(urls)
+            urls.extend(added)
+            if added:
+                logging.info(
+                    "Added %s field links from sitemap (total now %s)",
+                    len(urls) - before,
+                    len(urls),
+                )
+    except Exception as exc:  # noqa: BLE001 - continue to other fallbacks
+        logging.warning("Sitemap URL crawl failed: %s", exc)
 
-    # 3) Listing API last.
-    if not urls:
-        logging.info("Falling back to listing API for URLs")
-        try:
-            for page in range(1, 60):
-                batch = fetch_listing(client, page, 200)
-                if not batch:
-                    break
-                for record in batch:
-                    if isinstance(record, dict):
-                        url = record.get("url") or record.get("link")
-                        if not url and record.get("slug"):
-                            url = f"https://www.soccerfieldmap.com/field/{record['slug']}"
-                        if url:
-                            urls.append(str(url))
-            if urls:
-                logging.info("Discovered %s field links from listing API", len(urls))
-        except Exception as exc:  # noqa: BLE001 - avoid crashing collection
-            logging.warning("Listing URL discovery failed: %s", exc)
+    # 3) Merge listing API URLs to catch anything not present elsewhere.
+    try:
+        logging.info("Merging listing API URLs")
+        for page in range(1, 60):
+            batch = fetch_listing(client, page, 200)
+            if not batch:
+                break
+            for record in batch:
+                if isinstance(record, dict):
+                    url = record.get("url") or record.get("link")
+                    if not url and record.get("slug"):
+                        url = f"https://www.soccerfieldmap.com/field/{record['slug']}"
+                    if url:
+                        urls.append(str(url))
+        logging.info("Collected %s raw URLs from listing API", len(urls))
+    except Exception as exc:  # noqa: BLE001 - avoid crashing collection
+        logging.warning("Listing URL discovery failed: %s", exc)
 
     deduped = sorted({u.rstrip('/') for u in urls if u})
     logging.info("Total unique field links gathered: %s", len(deduped))

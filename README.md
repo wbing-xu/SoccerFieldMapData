@@ -1,6 +1,6 @@
 # SoccerFieldMap 数据抓取器
 
-脚本会从 https://www.soccerfieldmap.com 抓取全部场地详情页链接，优先模拟“Explore 页 -> STATE -> FIELDS”的点击流程（直接解析 Explore 页的 Next.js 数据），若拿不到则回退到 sitemap 和 API，再逐个打开详情页解析场地名，并用场地名去维基百科查询场地面积。结果实时写入 CSV，方便中途查看或恢复。
+脚本会从 https://www.soccerfieldmap.com 抓取全部场地详情页链接，优先模拟“Explore 页 -> STATE -> FIELDS”的点击流程（直接解析 Explore 页的 Next.js 数据），然后无论如何都会合并 sitemap 与 API 返回的链接，确保各州所有场地都被覆盖，再逐个打开详情页解析场地名，并用场地名去维基百科查询场地面积。结果实时写入 CSV，方便中途查看或恢复。
 
 ## 输出字段
 CSV 列名（中文）：
