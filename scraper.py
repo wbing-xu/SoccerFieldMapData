@@ -8,9 +8,11 @@ interruption.
 from __future__ import annotations
 
 import argparse
+import csv
 import dataclasses
 import json
 import logging
+import os
 import random
 import re
 import sqlite3
@@ -31,6 +33,17 @@ DEFAULT_USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+]
+CSV_COLUMNS = [
+    "external_id",
+    "name",
+    "address",
+    "latitude",
+    "longitude",
+    "area_sqm",
+    "pitch_count",
+    "wiki_title",
+    "wiki_url",
 ]
 
 
@@ -98,6 +111,55 @@ class FieldStorage:
             (str(page),),
         )
         self._conn.commit()
+
+
+class CsvSink:
+    def __init__(self, csv_path: Path) -> None:
+        self.csv_path = csv_path
+        self.csv_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._existing_ids = self._load_existing_ids()
+
+    @property
+    def existing_ids(self) -> set[str]:
+        return set(self._existing_ids)
+
+    def _load_existing_ids(self) -> set[str]:
+        if not self.csv_path.exists():
+            return set()
+        ids: set[str] = set()
+        try:
+            with self.csv_path.open("r", newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                if "external_id" not in (reader.fieldnames or []):
+                    return set()
+                for row in reader:
+                    if row.get("external_id"):
+                        ids.add(row["external_id"])
+        except (OSError, csv.Error) as exc:
+            logging.warning("Unable to read existing CSV %s: %s", self.csv_path, exc)
+        return ids
+
+    def append(self, field: Field) -> None:
+        with self._lock:
+            if field.external_id in self._existing_ids:
+                return
+            write_header = not self.csv_path.exists() or self.csv_path.stat().st_size == 0
+            row = {col: getattr(field, col) for col in CSV_COLUMNS}
+            for key, value in row.items():
+                if value is None:
+                    row[key] = ""
+            try:
+                with self.csv_path.open("a", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS)
+                    if write_header:
+                        writer.writeheader()
+                    writer.writerow(row)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                self._existing_ids.add(field.external_id)
+            except OSError as exc:
+                logging.error("Failed to write CSV row for %s: %s", field.external_id, exc)
 
     def processed_ids(self) -> set[str]:
         cur = self._conn.execute("SELECT external_id FROM fields;")
@@ -681,6 +743,7 @@ def iter_fields(client: HttpClient, start_page: int, page_size: int) -> Iterable
 def main() -> None:
     parser = argparse.ArgumentParser(description="Scrape soccerfieldmap.com listings.")
     parser.add_argument("--db", type=Path, default=Path("data/fields.sqlite"))
+    parser.add_argument("--csv", type=Path, default=Path("data/fields.csv"), help="CSV output written incrementally")
     parser.add_argument("--page-size", type=int, default=200)
     parser.add_argument("--wiki-workers", type=int, default=5, help="Parallel workers for Wikipedia enrichment")
     parser.add_argument("--max-attempts", type=int, default=6, help="HTTP retry attempts per request")
@@ -698,7 +761,9 @@ def main() -> None:
     )
 
     args.db.parent.mkdir(parents=True, exist_ok=True)
+    args.csv.parent.mkdir(parents=True, exist_ok=True)
     storage = FieldStorage(args.db)
+    csv_sink = CsvSink(args.csv)
     listing_client = HttpClient(
         DEFAULT_USER_AGENTS,
         max_attempts=args.max_attempts,
@@ -714,7 +779,7 @@ def main() -> None:
         backoff_cap=args.backoff_cap,
         timeout=args.timeout,
     )
-    processed = storage.processed_ids()
+    processed = storage.processed_ids() | csv_sink.existing_ids
     start_page = storage.last_page()
 
     try:
@@ -746,6 +811,7 @@ def main() -> None:
                         logging.error("Worker failed for %s: %s", external_id, exc)
                         continue
                     storage.save_field(enriched)
+                    csv_sink.append(enriched)
                     processed.add(external_id)
 
                 storage.mark_page(page_index + 1)

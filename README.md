@@ -6,12 +6,13 @@ This repository provides a resumable scraper for soccerfieldmap.com with Wikiped
 - Pulls paginated field listings from `https://www.soccerfieldmap.com/api/fields` (adjustable with `LISTING_URL`). Pagination starts at page **1** to match the live API, uses browser-like headers plus a homepage warmup to mimic real users, and gracefully stops if the server replies 404 for a page.
 - If the API endpoint keeps returning 404 for the first page, the scraper automatically falls back to extracting the field list from the public Explore page (`https://www.soccerfieldmap.com/explore`) by parsing the embedded Next.js data blob, tolerating both script-tag and inline `__NEXT_DATA__` shapes. If that markup is unavailable (e.g., the Explore page only renders a block/403 shell), it will grab the Next.js `buildId` from any reachable page (including by scanning static asset URLs when the data blob is missing) and hit the corresponding `/_next/data/{buildId}/explore.json` endpoint before giving up. If every Next.js path is blocked, it will crawl the Explore page like a user to harvest all `/field/...` links and parse each detail page's `application/ld+json`. As a final escape hatch, it scans the public sitemap for `/field/` URLs and parses each page to recover names/addresses so the run can still complete.
 - For each field, attempts to enrich the record with area and pitch-count information from Wikipedia via the public API.
-- Saves progress and results in a SQLite database so the job can restart after any interruption.
+- Saves progress and results in a SQLite database so the job can restart after any interruption, and writes each row to a human-readable CSV so you can inspect data live while the scraper runs.
 
 ## Running the scraper
 ```bash
 python scraper.py \
   --db data/fields.sqlite \
+  --csv data/fields.csv \
   --page-size 200 \
   --wiki-workers 5 \
   --backoff 1.0 \
@@ -22,11 +23,12 @@ python scraper.py \
 Key options:
 - `--wiki-workers`: concurrent Wikipedia lookups to speed up enrichment while staying polite.
 - `--max-attempts`, `--backoff`, `--backoff-cap`, `--timeout`: tune anti-scraping resilience and retry behaviour.
-- `--max-pages`: stop early for spot checks; progress is always saved in SQLite tables.
+- `--csv`: path to the incrementally written CSV output; existing rows are deduplicated so restarts only append new fields.
+- `--max-pages`: stop early for spot checks; progress is always saved in SQLite tables and the CSV is flushed on every row.
 - HTTP requests include rotating User-Agents, Referer headers, and an automatic warmup visit to the homepage to pick up cookies; 404s on the listing endpoint are suppressed and treated as end-of-data rather than hard failures.
 
 The database stores:
 - `fields` table: name, address (required), coordinates, inferred area (square metres), pitch count, and Wikipedia source info.
 - `progress` table: tracks the last listing page processed to enable resuming.
 
-Outputs are written immediately to the database after each field; retries/backoff and graceful interrupt handling prevent unexpected crashes.
+Outputs are written immediately to both the SQLite database and the CSV after each field; retries/backoff and graceful interrupt handling prevent unexpected crashes.
