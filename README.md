@@ -3,7 +3,7 @@
 This repository provides a resumable scraper for soccerfieldmap.com with Wikipedia enrichment and built-in retry/backoff logic.
 
 ## What it does
-- Pulls paginated field listings from `https://www.soccerfieldmap.com/api/fields` (adjustable with `LISTING_URL`).
+- Pulls paginated field listings from `https://www.soccerfieldmap.com/api/fields` (adjustable with `LISTING_URL`). Pagination starts at page **1** to match the live API and gracefully stops if the server replies 404 for a page.
 - For each field, attempts to enrich the record with area and pitch-count information from Wikipedia via the public API.
 - Saves progress and results in a SQLite database so the job can restart after any interruption.
 

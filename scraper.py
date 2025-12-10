@@ -87,7 +87,7 @@ class FieldStorage:
             "SELECT value FROM progress WHERE name='listing_page' LIMIT 1;"
         )
         row = cur.fetchone()
-        return int(row[0]) if row else 0
+        return int(row[0]) if row else 1
 
     def mark_page(self, page: int) -> None:
         self._conn.execute(
@@ -186,10 +186,18 @@ class HttpClient:
 
 
 def fetch_listing(client: HttpClient, page: int, page_size: int) -> List[Dict[str, object]]:
-    response = client.get(
-        LISTING_URL,
-        params={"page": page, "page_size": page_size},
-    )
+    try:
+        response = client.get(
+            LISTING_URL,
+            params={"page": page, "page_size": page_size},
+        )
+    except requests.HTTPError as exc:  # noqa: BLE001 - controlled handling for 404
+        status = exc.response.status_code if exc.response else None
+        if status == 404:
+            logging.warning("Listing page %s returned 404, treating as end of data", page)
+            return []
+        raise
+
     payload = response.json()
     if isinstance(payload, dict) and "results" in payload:
         return payload["results"]
