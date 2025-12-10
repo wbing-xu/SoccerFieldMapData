@@ -25,6 +25,7 @@ import requests
 
 LISTING_URL = "https://www.soccerfieldmap.com/api/fields"
 EXPLORE_URL = "https://www.soccerfieldmap.com/explore"
+SITEMAP_URL = "https://www.soccerfieldmap.com/sitemap.xml"
 WIKIPEDIA_API = "https://en.wikipedia.org/w/api.php"
 DEFAULT_USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -388,6 +389,81 @@ def bootstrap_from_explore(client: HttpClient) -> List[Dict[str, object]]:
     return []
 
 
+
+
+
+def _extract_ld_json(html: str) -> List[Dict[str, object]]:
+    ld_blocks: List[Dict[str, object]] = []
+    for match in re.finditer(r"<script[^>]*application/ld\+json[^>]*>(.*?)</script>", html, re.DOTALL | re.IGNORECASE):
+        try:
+            data = json.loads(match.group(1))
+        except Exception:  # noqa: BLE001 - ignore malformed JSON
+            continue
+        if isinstance(data, list):
+            ld_blocks.extend([item for item in data if isinstance(item, dict)])
+        elif isinstance(data, dict):
+            ld_blocks.append(data)
+    return ld_blocks
+
+
+def _extract_field_from_page(url: str, html: str) -> Optional[Dict[str, object]]:
+    ld_blocks = _extract_ld_json(html)
+    for block in ld_blocks:
+        if block.get("@type") in {"Place", "LocalBusiness", "SportsActivityLocation"}:
+            name = block.get("name") or block.get("headline") or ""
+            address = block.get("address") or block.get("streetAddress") or ""
+            if isinstance(address, dict):
+                address = " ".join(str(v) for v in address.values() if v)
+            name = str(name).strip()
+            address = str(address).strip()
+            if name and address:
+                return {
+                    "id": url.rstrip("/").split("/")[-1],
+                    "name": name,
+                    "address": address,
+                    "lat": block.get("geo", {}).get("latitude") if isinstance(block.get("geo"), dict) else None,
+                    "lng": block.get("geo", {}).get("longitude") if isinstance(block.get("geo"), dict) else None,
+                }
+    return None
+
+
+def bootstrap_from_sitemap(client: HttpClient, limit: Optional[int] = None) -> List[Dict[str, object]]:
+    try:
+        response = client.get(SITEMAP_URL, allow_statuses={403, 404})
+    except Exception as exc:  # noqa: BLE001 - fallback should never crash caller
+        logging.warning("Sitemap fetch failed: %s", exc)
+        return []
+
+    if response.status_code >= 400:
+        logging.warning("Sitemap unavailable (status %s)", response.status_code)
+        return []
+
+    urls: List[str] = re.findall(r"<loc>(.*?)</loc>", response.text)
+    field_urls = [u for u in urls if "/fields/" in u]
+    if not field_urls:
+        logging.error("No field URLs discovered in sitemap")
+        return []
+
+    if limit:
+        field_urls = field_urls[:limit]
+
+    records: List[Dict[str, object]] = []
+    for idx, url in enumerate(field_urls, start=1):
+        try:
+            html = client.get(url, referer=EXPLORE_URL, allow_statuses={403}).text
+            record = _extract_field_from_page(url, html)
+            if record:
+                records.append(record)
+            else:
+                logging.debug("No structured data found for %s", url)
+        except Exception as exc:  # noqa: BLE001 - continue despite failures
+            logging.warning("Failed to parse field page %s: %s", url, exc)
+        if idx % 50 == 0:
+            logging.info("Processed %s/%s field detail pages from sitemap", idx, len(field_urls))
+
+    logging.info("Collected %s fields from sitemap pages", len(records))
+    return records
+
 def infer_field(record: Dict[str, object]) -> Field:
     external_id = str(record.get("id") or record.get("uuid") or record.get("_id"))
     name = str(record.get("name") or "").strip()
@@ -527,17 +603,27 @@ def iter_fields(client: HttpClient, start_page: int, page_size: int) -> Iterable
         if not batch:
             if page == start_page and not attempted_bootstrap:
                 attempted_bootstrap = True
-                try:
-                    bootstrap = bootstrap_from_explore(client)
-                except Exception as exc:  # noqa: BLE001 - we want to bubble after logging
-                    logging.error("Explore bootstrap failed: %s", exc)
+                for source_name, bootstrap_fn in (
+                    ("explore bootstrap", bootstrap_from_explore),
+                    ("sitemap bootstrap", lambda c: bootstrap_from_sitemap(c)),
+                ):
+                    try:
+                        bootstrap = bootstrap_fn(client)
+                    except Exception as exc:  # noqa: BLE001 - keep trying other fallbacks
+                        logging.error("%s failed: %s", source_name.capitalize(), exc)
+                        bootstrap = []
+                    if bootstrap:
+                        logging.info(
+                            "Yielding %s data in %s-sized chunks",
+                            source_name,
+                            page_size,
+                        )
+                        for idx in range(0, len(bootstrap), page_size):
+                            yield bootstrap[idx : idx + page_size]
+                            page += 1
+                        break
+                else:
                     break
-                if not bootstrap:
-                    break
-                logging.info("Yielding explore bootstrap data in %s-sized chunks", page_size)
-                for idx in range(0, len(bootstrap), page_size):
-                    yield bootstrap[idx : idx + page_size]
-                    page += 1
                 break
             break
         yield batch
