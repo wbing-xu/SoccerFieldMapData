@@ -536,6 +536,21 @@ def _load_next_data_from_html(html: str) -> Optional[Dict[str, object]]:
         return None
 
 
+def _discover_field_urls_from_html(html: str) -> List[str]:
+    """Extract /field/ links from raw explore HTML, preserving encounter order."""
+
+    seen: set[str] = set()
+    results: List[str] = []
+
+    for match in re.finditer(r"href=['\"](/field/[^\"'#\s>]+)", html):
+        url = match.group(1)
+        if url not in seen:
+            seen.add(url)
+            results.append(url)
+
+    return results
+
+
 def _discover_build_id(html: str) -> Optional[str]:
     match = re.search(r"buildId\":\"(.*?)\"", html)
     if match:
