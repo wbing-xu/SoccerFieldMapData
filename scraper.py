@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 LISTING_URL = "https://www.soccerfieldmap.com/api/fields"
 EXPLORE_URL = "https://www.soccerfieldmap.com/explore"
@@ -144,6 +146,7 @@ class HttpClient:
         backoff_cap: float = 30.0,
         timeout: int = 20,
         warmup_url: Optional[str] = None,
+        delay_range: tuple[float, float] = (0.05, 0.6),
     ) -> None:
         self.user_agents = user_agents
         self.max_attempts = max_attempts
@@ -151,6 +154,7 @@ class HttpClient:
         self.backoff_cap = backoff_cap
         self.timeout = timeout
         self.warmup_url = warmup_url
+        self.delay_range = delay_range
         self._local = threading.local()
 
     def _headers(self, referer: Optional[str] = None) -> Dict[str, str]:
@@ -168,7 +172,18 @@ class HttpClient:
 
     def _session(self) -> requests.Session:
         if not hasattr(self._local, "session"):
-            self._local.session = requests.Session()
+            session = requests.Session()
+            retry = Retry(
+                total=0,
+                connect=self.max_attempts,
+                read=self.max_attempts,
+                status_forcelist=[429, 500, 502, 503, 504],
+                backoff_factor=self.backoff_seconds,
+            )
+            adapter = HTTPAdapter(max_retries=retry)
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            self._local.session = session
             if self.warmup_url:
                 try:
                     self._local.session.get(
@@ -192,6 +207,9 @@ class HttpClient:
         delay = self.backoff_seconds
         for attempt in range(1, self.max_attempts + 1):
             try:
+                # Light human-like delay to avoid aggressive request bursts.
+                if self.delay_range[1] > 0:
+                    time.sleep(random.uniform(*self.delay_range))
                 response = self._session().get(
                     url,
                     params=params,
@@ -247,7 +265,11 @@ def fetch_listing(client: HttpClient, page: int, page_size: int) -> List[Dict[st
         logging.warning("Listing page %s returned 404 after allowlist, treating as end of data", page)
         return []
 
-    payload = response.json()
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        logging.warning("Failed to decode listing JSON page %s: %s", page, exc)
+        return []
     if isinstance(payload, dict) and "results" in payload:
         return payload["results"]
     if isinstance(payload, list):
@@ -551,7 +573,11 @@ def bootstrap_from_explore_links(client: HttpClient, limit: Optional[int] = None
                 allow_statuses={403, 404},
             )
             if explore_json.status_code < 400:
-                data = explore_json.json()
+                try:
+                    data = explore_json.json()
+                except ValueError as exc:  # noqa: BLE001 - continue to HTML parsing
+                    logging.warning("Explore _next JSON decode failed: %s", exc)
+                    data = None
                 links = _extract_field_links_from_payload(data)
                 if links:
                     logging.info("Extracted %s field links from explore _next JSON", len(links))
@@ -700,32 +726,44 @@ def fetch_field_detail(client: HttpClient, url: str) -> Optional[Field]:
 
 
 def wikipedia_search(client: HttpClient, title: str) -> Optional[Dict[str, object]]:
-    response = client.get(
-        WIKIPEDIA_API,
-        params={
-            "action": "query",
-            "list": "search",
-            "srsearch": title,
-            "format": "json",
-            "srlimit": 1,
-        },
-    )
-    data = response.json()
-    hits = data.get("query", {}).get("search", [])
+    try:
+        response = client.get(
+            WIKIPEDIA_API,
+            params={
+                "action": "query",
+                "list": "search",
+                "srsearch": title,
+                "format": "json",
+                "srlimit": 1,
+            },
+        )
+        data = response.json()
+    except Exception as exc:  # noqa: BLE001 - tolerate transient wiki failures
+        logging.warning("Wikipedia search request failed for '%s': %s", title, exc)
+        return None
+
+    hits = data.get("query", {}).get("search", []) if isinstance(data, dict) else []
     return hits[0] if hits else None
 
 
 def wikipedia_page(client: HttpClient, pageid: int) -> Optional[str]:
-    response = client.get(
-        WIKIPEDIA_API,
-        params={
-            "action": "parse",
-            "pageid": pageid,
-            "prop": "wikitext",
-            "format": "json",
-        },
-    )
-    data = response.json()
+    try:
+        response = client.get(
+            WIKIPEDIA_API,
+            params={
+                "action": "parse",
+                "pageid": pageid,
+                "prop": "wikitext",
+                "format": "json",
+            },
+        )
+        data = response.json()
+    except Exception as exc:  # noqa: BLE001 - avoid crashing enrichment
+        logging.warning("Wikipedia page request failed for %s: %s", pageid, exc)
+        return None
+
+    if not isinstance(data, dict):
+        return None
     wikitext = data.get("parse", {}).get("wikitext", {}).get("*")
     return wikitext
 
@@ -809,6 +847,18 @@ def main() -> None:
     parser.add_argument("--backoff", type=float, default=1.0, help="Initial backoff (seconds) for retries")
     parser.add_argument("--backoff-cap", type=float, default=20.0, help="Max backoff (seconds) for retries")
     parser.add_argument("--timeout", type=int, default=20, help="HTTP timeout per request")
+    parser.add_argument(
+        "--min-delay",
+        type=float,
+        default=0.05,
+        help="Minimum random delay before any HTTP request to mimic human clicks",
+    )
+    parser.add_argument(
+        "--max-delay",
+        type=float,
+        default=0.6,
+        help="Maximum random delay before any HTTP request to mimic human clicks",
+    )
     parser.add_argument("--log-level", default="INFO", help="Logging level (DEBUG, INFO, WARNING)")
     args = parser.parse_args()
 
@@ -828,6 +878,7 @@ def main() -> None:
         backoff_cap=args.backoff_cap,
         timeout=args.timeout,
         warmup_url="https://www.soccerfieldmap.com/",
+        delay_range=(args.min_delay, args.max_delay),
     )
     wiki_client = HttpClient(
         DEFAULT_USER_AGENTS,
@@ -835,6 +886,7 @@ def main() -> None:
         backoff_seconds=args.backoff,
         backoff_cap=args.backoff_cap,
         timeout=args.timeout,
+        delay_range=(args.min_delay, args.max_delay),
     )
     processed = progress.processed
 

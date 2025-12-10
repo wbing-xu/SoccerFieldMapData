@@ -23,6 +23,8 @@ python scraper.py \
 - 如果需要加快或放缓请求，可调整：
   - `--wiki-workers`（并发维基请求数）
   - `--max-attempts`、`--backoff`、`--backoff-cap`、`--timeout`（HTTP 重试和超时）
+  - `--min-delay`、`--max-delay`（每个请求前的随机停顿，模拟人工点击节奏，降低反爬触发几率）
+- 已对所有抓取和解析步骤加上异常捕获：单个页面或维基请求失败会被跳过记录日志，不会导致整体退出。
 
 ## 依赖安装
 ```bash
