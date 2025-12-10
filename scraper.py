@@ -1,9 +1,8 @@
 """Offline-friendly scraper for SoccerFieldMap.
 
 This script downloads soccer field metadata from soccerfieldmap.com,
-optionally enriches it with Wikipedia information (area and pitch count),
-and stores everything in a SQLite database so work can resume after any
-interruption.
+optionally enriches it with Wikipedia information (area),
+and stores everything directly in a CSV for live inspection and resume.
 """
 from __future__ import annotations
 
@@ -15,7 +14,6 @@ import logging
 import os
 import random
 import re
-import sqlite3
 import sys
 import threading
 import time
@@ -34,83 +32,46 @@ DEFAULT_USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
 ]
-CSV_COLUMNS = [
-    "external_id",
-    "name",
-    "address",
-    "latitude",
-    "longitude",
-    "area_sqm",
-    "pitch_count",
-    "wiki_title",
-    "wiki_url",
-]
+CSV_COLUMNS = ["场地名", "场地链接", "场地面积", "场地面积wiki链接"]
 
 
 @dataclasses.dataclass
 class Field:
     external_id: str
     name: str
-    address: str
+    url: str
+    address: str = ""
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     area_sqm: Optional[float] = None
-    pitch_count: Optional[int] = None
-    wiki_title: Optional[str] = None
     wiki_url: Optional[str] = None
 
 
-class FieldStorage:
-    def __init__(self, db_path: Path) -> None:
-        self.db_path = db_path
-        self._conn = sqlite3.connect(self.db_path)
-        self._conn.execute("PRAGMA journal_mode=WAL;")
-        self._conn.execute("PRAGMA synchronous=NORMAL;")
-        self._ensure_schema()
-
-    def _ensure_schema(self) -> None:
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS fields (
-                external_id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                address TEXT NOT NULL,
-                latitude REAL,
-                longitude REAL,
-                area_sqm REAL,
-                pitch_count INTEGER,
-                wiki_title TEXT,
-                wiki_url TEXT,
-                updated_at TEXT NOT NULL
-            );
-            """
-        )
-        self._conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS progress (
-                name TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            """
-        )
-        self._conn.commit()
-
-    def close(self) -> None:
-        self._conn.close()
+class ProgressTracker:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
 
     def last_page(self) -> int:
-        cur = self._conn.execute(
-            "SELECT value FROM progress WHERE name='listing_page' LIMIT 1;"
-        )
-        row = cur.fetchone()
-        return int(row[0]) if row else 1
+        if not self.path.exists():
+            return 1
+        try:
+            with self.path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            return int(data.get("last_page", 1))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return 1
 
     def mark_page(self, page: int) -> None:
-        self._conn.execute(
-            "REPLACE INTO progress (name, value) VALUES ('listing_page', ?);",
-            (str(page),),
-        )
-        self._conn.commit()
+        with self._lock:
+            try:
+                with self.path.open("w", encoding="utf-8") as handle:
+                    json.dump({"last_page": page}, handle)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            except OSError as exc:
+                logging.warning("Failed to persist progress to %s: %s", self.path, exc)
 
 
 class CsvSink:
@@ -118,37 +79,40 @@ class CsvSink:
         self.csv_path = csv_path
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        self._existing_ids = self._load_existing_ids()
+        self._existing_links = self._load_existing_links()
 
     @property
-    def existing_ids(self) -> set[str]:
-        return set(self._existing_ids)
+    def existing_links(self) -> set[str]:
+        return set(self._existing_links)
 
-    def _load_existing_ids(self) -> set[str]:
+    def _load_existing_links(self) -> set[str]:
         if not self.csv_path.exists():
             return set()
-        ids: set[str] = set()
+        links: set[str] = set()
         try:
             with self.csv_path.open("r", newline="", encoding="utf-8") as handle:
                 reader = csv.DictReader(handle)
-                if "external_id" not in (reader.fieldnames or []):
+                if CSV_COLUMNS[1] not in (reader.fieldnames or []):
                     return set()
                 for row in reader:
-                    if row.get("external_id"):
-                        ids.add(row["external_id"])
+                    link = row.get(CSV_COLUMNS[1])
+                    if link:
+                        links.add(link)
         except (OSError, csv.Error) as exc:
             logging.warning("Unable to read existing CSV %s: %s", self.csv_path, exc)
-        return ids
+        return links
 
     def append(self, field: Field) -> None:
         with self._lock:
-            if field.external_id in self._existing_ids:
+            if field.url in self._existing_links:
                 return
             write_header = not self.csv_path.exists() or self.csv_path.stat().st_size == 0
-            row = {col: getattr(field, col) for col in CSV_COLUMNS}
-            for key, value in row.items():
-                if value is None:
-                    row[key] = ""
+            row = {
+                CSV_COLUMNS[0]: field.name,
+                CSV_COLUMNS[1]: field.url,
+                CSV_COLUMNS[2]: field.area_sqm if field.area_sqm is not None else "",
+                CSV_COLUMNS[3]: field.wiki_url or "",
+            }
             try:
                 with self.csv_path.open("a", newline="", encoding="utf-8") as handle:
                     writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS)
@@ -157,35 +121,9 @@ class CsvSink:
                     writer.writerow(row)
                     handle.flush()
                     os.fsync(handle.fileno())
-                self._existing_ids.add(field.external_id)
+                self._existing_links.add(field.url)
             except OSError as exc:
                 logging.error("Failed to write CSV row for %s: %s", field.external_id, exc)
-
-    def processed_ids(self) -> set[str]:
-        cur = self._conn.execute("SELECT external_id FROM fields;")
-        return {row[0] for row in cur.fetchall()}
-
-    def save_field(self, field: Field) -> None:
-        self._conn.execute(
-            """
-            REPLACE INTO fields (
-                external_id, name, address, latitude, longitude, area_sqm,
-                pitch_count, wiki_title, wiki_url, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'));
-            """,
-            (
-                field.external_id,
-                field.name,
-                field.address,
-                field.latitude,
-                field.longitude,
-                field.area_sqm,
-                field.pitch_count,
-                field.wiki_title,
-                field.wiki_url,
-            ),
-        )
-        self._conn.commit()
 
 
 class HttpClient:
@@ -481,6 +419,7 @@ def _extract_field_from_page(url: str, html: str) -> Optional[Dict[str, object]]
             if name and address:
                 return {
                     "id": url.rstrip("/").split("/")[-1],
+                    "url": url,
                     "name": name,
                     "address": address,
                     "lat": block.get("geo", {}).get("latitude") if isinstance(block.get("geo"), dict) else None,
@@ -577,6 +516,12 @@ def infer_field(record: Dict[str, object]) -> Field:
     external_id = str(record.get("id") or record.get("uuid") or record.get("_id"))
     name = str(record.get("name") or "").strip()
     address = str(record.get("address") or record.get("location") or "").strip()
+    url = str(
+        record.get("url")
+        or record.get("link")
+        or record.get("path")
+        or f"https://www.soccerfieldmap.com/field/{external_id}"
+    )
     latitude = record.get("lat") or record.get("latitude")
     longitude = record.get("lng") or record.get("longitude")
     if not external_id or not name or not address:
@@ -584,6 +529,7 @@ def infer_field(record: Dict[str, object]) -> Field:
     return Field(
         external_id=external_id,
         name=name,
+        url=url,
         address=address,
         latitude=float(latitude) if latitude is not None else None,
         longitude=float(longitude) if longitude is not None else None,
@@ -642,16 +588,6 @@ def validate_area(area_sqm: Optional[float]) -> Optional[float]:
     return None
 
 
-def parse_pitch_count(wikitext: str) -> Optional[int]:
-    pitch_match = re.search(r"pitches?\s*=\s*([0-9]+)", wikitext, re.IGNORECASE)
-    if pitch_match:
-        return int(pitch_match.group(1))
-    field_match = re.search(r"fields?\s*=\s*([0-9]+)", wikitext, re.IGNORECASE)
-    if field_match:
-        return int(field_match.group(1))
-    return None
-
-
 def extract_area_from_wikitext(wikitext: str) -> Optional[float]:
     for line in wikitext.splitlines():
         if "area" in line.lower():
@@ -672,7 +608,6 @@ def enrich_with_wikipedia(client: HttpClient, field: Field) -> Field:
         return field
 
     pageid = search_hit.get("pageid")
-    title = search_hit.get("title")
     wikitext = None
 
     if pageid is not None:
@@ -682,20 +617,17 @@ def enrich_with_wikipedia(client: HttpClient, field: Field) -> Field:
             logging.warning("Wikipedia page fetch failed for '%s' (%s): %s", field.name, pageid, exc)
 
     area = None
-    pitch_count = None
     if wikitext:
         area = validate_area(extract_area_from_wikitext(wikitext))
-        pitch_count = parse_pitch_count(wikitext)
     wiki_url = f"https://en.wikipedia.org/?curid={pageid}" if pageid else None
     return Field(
         external_id=field.external_id,
         name=field.name,
+        url=field.url,
         address=field.address,
         latitude=field.latitude,
         longitude=field.longitude,
         area_sqm=area,
-        pitch_count=pitch_count,
-        wiki_title=title,
         wiki_url=wiki_url,
     )
 
@@ -742,8 +674,13 @@ def iter_fields(client: HttpClient, start_page: int, page_size: int) -> Iterable
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Scrape soccerfieldmap.com listings.")
-    parser.add_argument("--db", type=Path, default=Path("data/fields.sqlite"))
     parser.add_argument("--csv", type=Path, default=Path("data/fields.csv"), help="CSV output written incrementally")
+    parser.add_argument(
+        "--progress",
+        type=Path,
+        default=Path("data/progress.json"),
+        help="Progress checkpoint for resuming from the last completed page",
+    )
     parser.add_argument("--page-size", type=int, default=200)
     parser.add_argument("--wiki-workers", type=int, default=5, help="Parallel workers for Wikipedia enrichment")
     parser.add_argument("--max-attempts", type=int, default=6, help="HTTP retry attempts per request")
@@ -760,9 +697,8 @@ def main() -> None:
         stream=sys.stdout,
     )
 
-    args.db.parent.mkdir(parents=True, exist_ok=True)
     args.csv.parent.mkdir(parents=True, exist_ok=True)
-    storage = FieldStorage(args.db)
+    progress = ProgressTracker(args.progress)
     csv_sink = CsvSink(args.csv)
     listing_client = HttpClient(
         DEFAULT_USER_AGENTS,
@@ -779,8 +715,8 @@ def main() -> None:
         backoff_cap=args.backoff_cap,
         timeout=args.timeout,
     )
-    processed = storage.processed_ids() | csv_sink.existing_ids
-    start_page = storage.last_page()
+    processed = csv_sink.existing_links
+    start_page = progress.last_page()
 
     try:
         with ThreadPoolExecutor(max_workers=args.wiki_workers) as executor:
@@ -794,7 +730,7 @@ def main() -> None:
                     except ValueError:
                         logging.warning("Skipping malformed listing: %s", record)
                         continue
-                    if field.external_id in processed:
+                    if field.url in processed:
                         continue
                     pending.append(field)
 
@@ -810,19 +746,16 @@ def main() -> None:
                     except Exception as exc:  # noqa: BLE001 - continue on worker failure
                         logging.error("Worker failed for %s: %s", external_id, exc)
                         continue
-                    storage.save_field(enriched)
                     csv_sink.append(enriched)
-                    processed.add(external_id)
+                    processed.add(enriched.url)
 
-                storage.mark_page(page_index + 1)
+                progress.mark_page(page_index + 1)
 
                 if args.max_pages is not None and (page_index + 1) >= (start_page + args.max_pages):
                     logging.info("Reached max pages limit (%s), stopping.", args.max_pages)
                     break
     except KeyboardInterrupt:
-        logging.warning("Interrupted by user, progress preserved up to page %s", storage.last_page())
-    finally:
-        storage.close()
+        logging.warning("Interrupted by user, progress preserved up to page %s", progress.last_page())
 
 
 if __name__ == "__main__":
