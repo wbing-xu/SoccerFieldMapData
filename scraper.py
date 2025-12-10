@@ -468,13 +468,58 @@ def _extract_field_from_page(url: str, html: str) -> Optional[Dict[str, object]]
     return None
 
 
-def _discover_field_urls_from_html(html: str) -> List[str]:
-    urls = set()
-    for match in re.finditer(r"href=\"([^\"]*?/field/[^\"#?']+)\"", html, re.IGNORECASE):
-        urls.add(match.group(1))
-    for match in re.finditer(r"href='([^']*?/field/[^'#?\"]+)'", html, re.IGNORECASE):
-        urls.add(match.group(1))
-    return sorted(urls)
+def _extract_field_links_from_payload(payload: object) -> List[str]:
+    links: set[str] = set()
+
+    def normalize(link: str) -> Optional[str]:
+        if not link:
+            return None
+        if "/field/" not in link and not link.startswith("/field/"):
+            return None
+        if not link.startswith("http"):
+            link = f"https://www.soccerfieldmap.com{link if link.startswith('/') else '/field/' + link}"
+        return link
+
+    def walk(node: object) -> None:
+        if isinstance(node, dict):
+            candidate_link = None
+            if isinstance(node.get("url"), str):
+                candidate_link = node["url"]
+            elif isinstance(node.get("href"), str):
+                candidate_link = node["href"]
+            elif isinstance(node.get("slug"), str):
+                candidate_link = node["slug"]
+
+            normalized = normalize(candidate_link) if candidate_link else None
+            if normalized:
+                links.add(normalized)
+
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(payload)
+    return sorted(links)
+
+
+def _load_next_data_from_html(html: str) -> Optional[Dict[str, object]]:
+    match = re.search(r"__NEXT_DATA__\".*?>(\{.*?\})</script", html, re.DOTALL)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+
+
+def _discover_build_id(html: str) -> Optional[str]:
+    match = re.search(r"buildId\":\"(.*?)\"", html)
+    if match:
+        return match.group(1)
+    match = re.search(r"/_next/static/(.*?)/_buildManifest.js", html)
+    return match.group(1) if match else None
 
 
 def bootstrap_from_explore_links(client: HttpClient, limit: Optional[int] = None) -> List[Dict[str, object]]:
@@ -488,6 +533,34 @@ def bootstrap_from_explore_links(client: HttpClient, limit: Optional[int] = None
         logging.warning("Explore page unavailable (status %s)", response.status_code)
         return []
 
+    payload = _load_next_data_from_html(response.text)
+    if payload:
+        links = _extract_field_links_from_payload(payload)
+        if links:
+            logging.info("Extracted %s field links from explore __NEXT_DATA__", len(links))
+            if limit:
+                links = links[:limit]
+            return [{"url": url} for url in links]
+
+    build_id = _discover_build_id(response.text)
+    if build_id:
+        try:
+            explore_json = client.get(
+                f"https://www.soccerfieldmap.com/_next/data/{build_id}/explore.json",
+                referer=EXPLORE_URL,
+                allow_statuses={403, 404},
+            )
+            if explore_json.status_code < 400:
+                data = explore_json.json()
+                links = _extract_field_links_from_payload(data)
+                if links:
+                    logging.info("Extracted %s field links from explore _next JSON", len(links))
+                    if limit:
+                        links = links[:limit]
+                    return [{"url": url} for url in links]
+        except Exception as exc:  # noqa: BLE001 - continue
+            logging.warning("Explore _next data fetch failed: %s", exc)
+
     field_urls = _discover_field_urls_from_html(response.text)
     if not field_urls:
         logging.error("No field links discovered on explore page")
@@ -496,23 +569,8 @@ def bootstrap_from_explore_links(client: HttpClient, limit: Optional[int] = None
     if limit:
         field_urls = field_urls[:limit]
 
-    records: List[Dict[str, object]] = []
-    for idx, url in enumerate(field_urls, start=1):
-        full_url = url if url.startswith("http") else f"https://www.soccerfieldmap.com{url}"
-        try:
-            html = client.get(full_url, referer=EXPLORE_URL, allow_statuses={403}).text
-            record = _extract_field_from_page(full_url, html)
-            if record:
-                records.append(record)
-            else:
-                logging.debug("No structured data found for %s", full_url)
-        except Exception as exc:  # noqa: BLE001 - continue despite failures
-            logging.warning("Failed to parse field page %s: %s", full_url, exc)
-        if idx % 50 == 0:
-            logging.info("Processed %s/%s field pages discovered from explore", idx, len(field_urls))
-
-    logging.info("Collected %s fields from explore page links", len(records))
-    return records
+    logging.info("Extracted %s field links from explore HTML anchors", len(field_urls))
+    return [{"url": url if url.startswith("http") else f"https://www.soccerfieldmap.com{url}"} for url in field_urls]
 
 
 def bootstrap_from_sitemap(client: HttpClient, limit: Optional[int] = None) -> List[Dict[str, object]]:
@@ -554,29 +612,29 @@ def bootstrap_from_sitemap(client: HttpClient, limit: Optional[int] = None) -> L
 
 
 def collect_field_urls(client: HttpClient) -> List[str]:
-    """Collect field links using multiple fallbacks (sitemap -> explore -> listing)."""
+    """Collect field links prioritizing the explore page states -> sitemap -> listing API."""
 
     urls: List[str] = []
 
-    # 1) Sitemap first for full coverage.
-    try:
-        response = client.get(SITEMAP_URL, allow_statuses={403, 404})
-        if response.status_code < 400:
-            sitemap_urls = re.findall(r"<loc>(.*?)</loc>", response.text)
-            urls.extend([u for u in sitemap_urls if "/field/" in u])
-            if urls:
-                logging.info("Discovered %s field links from sitemap", len(urls))
-    except Exception as exc:  # noqa: BLE001 - continue to other fallbacks
-        logging.warning("Sitemap URL crawl failed: %s", exc)
+    # 1) Crawl explore page (STATE -> FIELDS) to mirror manual clicks.
+    links = bootstrap_from_explore_links(client)
+    urls.extend([rec.get("url") for rec in links if isinstance(rec, dict) and rec.get("url")])
+    if urls:
+        logging.info("Discovered %s field links from explore page crawl", len(urls))
 
-    # 2) Explore page link scrape if sitemap empty.
+    # 2) Sitemap fallback if explore did not yield anything.
     if not urls:
-        links = bootstrap_from_explore_links(client)
-        urls.extend([rec.get("url") for rec in links if isinstance(rec, dict) and rec.get("url")])
-        if urls:
-            logging.info("Discovered %s field links from explore page crawl", len(urls))
+        try:
+            response = client.get(SITEMAP_URL, allow_statuses={403, 404})
+            if response.status_code < 400:
+                sitemap_urls = re.findall(r"<loc>(.*?)</loc>", response.text)
+                urls.extend([u for u in sitemap_urls if "/field/" in u])
+                if urls:
+                    logging.info("Discovered %s field links from sitemap", len(urls))
+        except Exception as exc:  # noqa: BLE001 - continue to other fallbacks
+            logging.warning("Sitemap URL crawl failed: %s", exc)
 
-    # 3) Fallback to listing endpoint if still empty.
+    # 3) Listing API last.
     if not urls:
         logging.info("Falling back to listing API for URLs")
         try:
