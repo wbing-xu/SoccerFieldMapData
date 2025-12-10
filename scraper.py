@@ -264,36 +264,52 @@ def _looks_like_field(record: object) -> bool:
     return has_name and has_address and has_id
 
 
+def _extract_next_data(html: str) -> Dict[str, object]:
+    """Extract and decode the __NEXT_DATA__ blob from varied markup shapes."""
+
+    decoder = json.JSONDecoder()
+
+    def _try_decode(body: str) -> Optional[Dict[str, object]]:
+        body = body.strip()
+        if not body:
+            return None
+        try:
+            payload, _ = decoder.raw_decode(body)
+            return payload
+        except json.JSONDecodeError:
+            return None
+
+    patterns = [
+        r"<script[^>]*id=[\"']__NEXT_DATA__[\"'][^>]*>(?P<body>{.*?})</script>",
+        r"__NEXT_DATA__\s*=\s*(?P<body>{.*})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            payload = _try_decode(match.group("body"))
+            if payload is not None:
+                return payload
+
+    marker = "__NEXT_DATA__"
+    marker_index = html.find(marker)
+    if marker_index != -1:
+        brace_index = html.find("{", marker_index)
+        if brace_index != -1:
+            payload = _try_decode(html[brace_index:])
+            if payload is not None:
+                return payload
+
+    snippet = html[:500].replace("\n", " ")
+    raise ValueError(f"Unable to locate NEXT_DATA payload on explore page (snippet: {snippet[:120]}...)")
+
+
 def bootstrap_from_explore(client: HttpClient) -> List[Dict[str, object]]:
     logging.warning(
         "Primary listing endpoint returned nothing; attempting to bootstrap from %s",
         EXPLORE_URL,
     )
-    response = client.get(EXPLORE_URL)
-    html = response.text
-
-    match = re.search(
-        r"<script[^>]*id=\"__NEXT_DATA__\"[^>]*>(?P<body>.*?)</script>",
-        html,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if not match:
-        inline_match = re.search(
-            r"__NEXT_DATA__\s*=\s*(?P<body>\{.*?\})\s*[;\n]",
-            html,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if inline_match:
-            match = inline_match
-
-    if not match:
-        raise ValueError("Unable to locate NEXT_DATA payload on explore page")
-
-    payload_raw = match.group("body")
-    try:
-        payload = json.loads(payload_raw)
-    except json.JSONDecodeError as exc:  # noqa: BLE001
-        raise ValueError("Explore page NEXT_DATA JSON is malformed") from exc
+    response = client.get(EXPLORE_URL, allow_statuses={403})
+    payload = _extract_next_data(response.text)
 
     for candidate_list in _iter_matching_lists(payload):
         if len(candidate_list) > 100 and all(_looks_like_field(item) for item in candidate_list):
