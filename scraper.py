@@ -133,30 +133,59 @@ class HttpClient:
         backoff_seconds: float = 1.0,
         backoff_cap: float = 30.0,
         timeout: int = 20,
+        warmup_url: Optional[str] = None,
     ) -> None:
         self.user_agents = user_agents
         self.max_attempts = max_attempts
         self.backoff_seconds = backoff_seconds
         self.backoff_cap = backoff_cap
         self.timeout = timeout
+        self.warmup_url = warmup_url
         self._local = threading.local()
 
-    def _headers(self) -> Dict[str, str]:
-        return {"User-Agent": random.choice(self.user_agents)}
+    def _headers(self, referer: Optional[str] = None) -> Dict[str, str]:
+        headers = {
+            "User-Agent": random.choice(self.user_agents),
+            "Accept": "text/html,application/json;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Connection": "keep-alive",
+        }
+        if referer:
+            headers["Referer"] = referer
+        return headers
 
     def _session(self) -> requests.Session:
         if not hasattr(self._local, "session"):
             self._local.session = requests.Session()
+            if self.warmup_url:
+                try:
+                    self._local.session.get(
+                        self.warmup_url,
+                        headers=self._headers(),
+                        timeout=self.timeout,
+                    )
+                    logging.debug("Warmed session with %s", self.warmup_url)
+                except requests.RequestException as exc:
+                    logging.debug("Warmup request to %s failed: %s", self.warmup_url, exc)
         return self._local.session
 
-    def get(self, url: str, *, params: Optional[Dict[str, object]] = None) -> requests.Response:
+    def get(
+        self,
+        url: str,
+        *,
+        params: Optional[Dict[str, object]] = None,
+        referer: Optional[str] = None,
+        allow_statuses: Optional[set[int]] = None,
+    ) -> requests.Response:
         delay = self.backoff_seconds
         for attempt in range(1, self.max_attempts + 1):
             try:
                 response = self._session().get(
                     url,
                     params=params,
-                    headers=self._headers(),
+                    headers=self._headers(referer=referer),
                     timeout=self.timeout,
                 )
             except requests.RequestException as exc:
@@ -164,6 +193,8 @@ class HttpClient:
                 if attempt == self.max_attempts:
                     raise
             else:
+                if allow_statuses and response.status_code in allow_statuses:
+                    return response
                 if response.status_code in {429, 503, 502, 500}:
                     retry_after = response.headers.get("Retry-After")
                     wait = float(retry_after) if retry_after else delay
@@ -192,6 +223,8 @@ def fetch_listing(client: HttpClient, page: int, page_size: int) -> List[Dict[st
         response = client.get(
             LISTING_URL,
             params={"page": page, "page_size": page_size},
+            referer=EXPLORE_URL,
+            allow_statuses={404},
         )
     except requests.HTTPError as exc:  # noqa: BLE001 - controlled handling for 404
         status = exc.response.status_code if exc.response else None
@@ -199,6 +232,10 @@ def fetch_listing(client: HttpClient, page: int, page_size: int) -> List[Dict[st
             logging.warning("Listing page %s returned 404, treating as end of data", page)
             return []
         raise
+
+    if response.status_code == 404:
+        logging.warning("Listing page %s returned 404 after allowlist, treating as end of data", page)
+        return []
 
     payload = response.json()
     if isinstance(payload, dict) and "results" in payload:
@@ -438,6 +475,7 @@ def main() -> None:
         backoff_seconds=args.backoff,
         backoff_cap=args.backoff_cap,
         timeout=args.timeout,
+        warmup_url="https://www.soccerfieldmap.com/",
     )
     wiki_client = HttpClient(
         DEFAULT_USER_AGENTS,
