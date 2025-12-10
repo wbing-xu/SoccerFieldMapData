@@ -314,6 +314,15 @@ def _extract_build_id(payload: Dict[str, object]) -> Optional[str]:
     return None
 
 
+def _extract_build_id_from_html(html: str) -> Optional[str]:
+    """Look for buildId in static asset paths when __NEXT_DATA__ is absent."""
+
+    match = re.search(r"/_next/static/([A-Za-z0-9_-]+)/_buildManifest\.js", html)
+    if match:
+        return match.group(1)
+    return None
+
+
 def _fetch_next_data_json(client: HttpClient, path: str, build_id: str) -> Optional[Dict[str, object]]:
     url = f"https://www.soccerfieldmap.com/_next/data/{build_id}{path}.json"
     try:
@@ -345,26 +354,38 @@ def bootstrap_from_explore(client: HttpClient) -> List[Dict[str, object]]:
 
     build_id = _extract_build_id(payload) if payload else None
     if not build_id:
+        build_id = _extract_build_id_from_html(response.text)
+    if not build_id:
         try:
             home_payload = _extract_next_data(client.get("https://www.soccerfieldmap.com/", allow_statuses={403}).text)
             build_id = _extract_build_id(home_payload)
         except Exception as exc:  # noqa: BLE001 - keep trying without crash
             logging.warning("Unable to read buildId from homepage: %s", exc)
+    if not build_id:
+        try:
+            home_html = client.get("https://www.soccerfieldmap.com/", allow_statuses={403}).text
+            build_id = _extract_build_id_from_html(home_html)
+        except Exception as exc:  # noqa: BLE001 - keep trying without crash
+            logging.warning("Unable to infer buildId from homepage markup: %s", exc)
 
     if build_id:
         logging.info("Attempting _next data fetch using buildId %s", build_id)
-        next_payload = _fetch_next_data_json(client, "/explore", build_id)
-        if isinstance(next_payload, dict):
-            payload = next_payload.get("pageProps") or next_payload
+        for path in ("/explore", "/explore/index"):
+            next_payload = _fetch_next_data_json(client, path, build_id)
+            if isinstance(next_payload, dict):
+                payload = next_payload.get("pageProps") or next_payload
+                break
 
     if not payload:
-        raise ValueError("No explore payload available from HTML or _next data")
+        logging.error("No explore payload available from HTML, inferred buildId, or _next data")
+        return []
 
     for candidate_list in _iter_matching_lists(payload):
         if len(candidate_list) > 100 and all(_looks_like_field(item) for item in candidate_list):
             logging.info("Found %s candidate fields in explore bootstrap", len(candidate_list))
             return [item for item in candidate_list if isinstance(item, dict)]
-    raise ValueError("No candidate field list discovered in explore bootstrap")
+    logging.error("No candidate field list discovered in explore bootstrap")
+    return []
 
 
 def infer_field(record: Dict[str, object]) -> Field:
