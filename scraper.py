@@ -427,6 +427,53 @@ def _extract_field_from_page(url: str, html: str) -> Optional[Dict[str, object]]
     return None
 
 
+def _discover_field_urls_from_html(html: str) -> List[str]:
+    urls = set()
+    for match in re.finditer(r"href=\"([^\"]*?/field/[^\"#?']+)\"", html, re.IGNORECASE):
+        urls.add(match.group(1))
+    for match in re.finditer(r"href='([^']*?/field/[^'#?\"]+)'", html, re.IGNORECASE):
+        urls.add(match.group(1))
+    return sorted(urls)
+
+
+def bootstrap_from_explore_links(client: HttpClient, limit: Optional[int] = None) -> List[Dict[str, object]]:
+    try:
+        response = client.get(EXPLORE_URL, allow_statuses={403, 404})
+    except Exception as exc:  # noqa: BLE001 - fallback should never crash caller
+        logging.warning("Explore-page link scrape failed: %s", exc)
+        return []
+
+    if response.status_code >= 400:
+        logging.warning("Explore page unavailable (status %s)", response.status_code)
+        return []
+
+    field_urls = _discover_field_urls_from_html(response.text)
+    if not field_urls:
+        logging.error("No field links discovered on explore page")
+        return []
+
+    if limit:
+        field_urls = field_urls[:limit]
+
+    records: List[Dict[str, object]] = []
+    for idx, url in enumerate(field_urls, start=1):
+        full_url = url if url.startswith("http") else f"https://www.soccerfieldmap.com{url}"
+        try:
+            html = client.get(full_url, referer=EXPLORE_URL, allow_statuses={403}).text
+            record = _extract_field_from_page(full_url, html)
+            if record:
+                records.append(record)
+            else:
+                logging.debug("No structured data found for %s", full_url)
+        except Exception as exc:  # noqa: BLE001 - continue despite failures
+            logging.warning("Failed to parse field page %s: %s", full_url, exc)
+        if idx % 50 == 0:
+            logging.info("Processed %s/%s field pages discovered from explore", idx, len(field_urls))
+
+    logging.info("Collected %s fields from explore page links", len(records))
+    return records
+
+
 def bootstrap_from_sitemap(client: HttpClient, limit: Optional[int] = None) -> List[Dict[str, object]]:
     try:
         response = client.get(SITEMAP_URL, allow_statuses={403, 404})
@@ -439,7 +486,7 @@ def bootstrap_from_sitemap(client: HttpClient, limit: Optional[int] = None) -> L
         return []
 
     urls: List[str] = re.findall(r"<loc>(.*?)</loc>", response.text)
-    field_urls = [u for u in urls if "/fields/" in u]
+    field_urls = [u for u in urls if "/field/" in u]
     if not field_urls:
         logging.error("No field URLs discovered in sitemap")
         return []
@@ -605,6 +652,7 @@ def iter_fields(client: HttpClient, start_page: int, page_size: int) -> Iterable
                 attempted_bootstrap = True
                 for source_name, bootstrap_fn in (
                     ("explore bootstrap", bootstrap_from_explore),
+                    ("explore link crawl", lambda c: bootstrap_from_explore_links(c)),
                     ("sitemap bootstrap", lambda c: bootstrap_from_sitemap(c)),
                 ):
                     try:
