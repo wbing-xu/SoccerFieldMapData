@@ -48,26 +48,35 @@ class Field:
 
 
 class ProgressTracker:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, seed: Optional[set[str]] = None) -> None:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
+        self._processed = self._load_existing(seed)
 
-    def last_page(self) -> int:
+    @property
+    def processed(self) -> set[str]:
+        return set(self._processed)
+
+    def _load_existing(self, seed: Optional[set[str]]) -> set[str]:
+        base: set[str] = set(seed or set())
         if not self.path.exists():
-            return 1
+            return base
         try:
             with self.path.open("r", encoding="utf-8") as handle:
                 data = json.load(handle)
-            return int(data.get("last_page", 1))
-        except (OSError, ValueError, json.JSONDecodeError):
-            return 1
+            saved = data.get("processed_links", []) if isinstance(data, dict) else []
+            base.update([link for link in saved if isinstance(link, str)])
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            logging.warning("Failed to read existing progress %s: %s", self.path, exc)
+        return base
 
-    def mark_page(self, page: int) -> None:
+    def mark_link(self, url: str) -> None:
         with self._lock:
+            self._processed.add(url)
             try:
                 with self.path.open("w", encoding="utf-8") as handle:
-                    json.dump({"last_page": page}, handle)
+                    json.dump({"processed_links": sorted(self._processed)}, handle)
                     handle.flush()
                     os.fsync(handle.fileno())
             except OSError as exc:
@@ -416,7 +425,7 @@ def _extract_field_from_page(url: str, html: str) -> Optional[Dict[str, object]]
                 address = " ".join(str(v) for v in address.values() if v)
             name = str(name).strip()
             address = str(address).strip()
-            if name and address:
+            if name:
                 return {
                     "id": url.rstrip("/").split("/")[-1],
                     "url": url,
@@ -446,7 +455,7 @@ def _extract_field_from_page(url: str, html: str) -> Optional[Dict[str, object]]
             if _looks_like_field(candidate):
                 name = str(candidate.get("name") or "").strip()
                 address = str(candidate.get("address") or candidate.get("location") or "").strip()
-                if name and address:
+                if name:
                     return {
                         "id": candidate.get("id") or candidate.get("uuid") or url.rstrip("/").split("/")[-1],
                         "url": url,
@@ -543,6 +552,54 @@ def bootstrap_from_sitemap(client: HttpClient, limit: Optional[int] = None) -> L
     logging.info("Collected %s fields from sitemap pages", len(records))
     return records
 
+
+def collect_field_urls(client: HttpClient) -> List[str]:
+    """Collect field links using multiple fallbacks (sitemap -> explore -> listing)."""
+
+    urls: List[str] = []
+
+    # 1) Sitemap first for full coverage.
+    try:
+        response = client.get(SITEMAP_URL, allow_statuses={403, 404})
+        if response.status_code < 400:
+            sitemap_urls = re.findall(r"<loc>(.*?)</loc>", response.text)
+            urls.extend([u for u in sitemap_urls if "/field/" in u])
+            if urls:
+                logging.info("Discovered %s field links from sitemap", len(urls))
+    except Exception as exc:  # noqa: BLE001 - continue to other fallbacks
+        logging.warning("Sitemap URL crawl failed: %s", exc)
+
+    # 2) Explore page link scrape if sitemap empty.
+    if not urls:
+        links = bootstrap_from_explore_links(client)
+        urls.extend([rec.get("url") for rec in links if isinstance(rec, dict) and rec.get("url")])
+        if urls:
+            logging.info("Discovered %s field links from explore page crawl", len(urls))
+
+    # 3) Fallback to listing endpoint if still empty.
+    if not urls:
+        logging.info("Falling back to listing API for URLs")
+        try:
+            for page in range(1, 60):
+                batch = fetch_listing(client, page, 200)
+                if not batch:
+                    break
+                for record in batch:
+                    if isinstance(record, dict):
+                        url = record.get("url") or record.get("link")
+                        if not url and record.get("slug"):
+                            url = f"https://www.soccerfieldmap.com/field/{record['slug']}"
+                        if url:
+                            urls.append(str(url))
+            if urls:
+                logging.info("Discovered %s field links from listing API", len(urls))
+        except Exception as exc:  # noqa: BLE001 - avoid crashing collection
+            logging.warning("Listing URL discovery failed: %s", exc)
+
+    deduped = sorted({u.rstrip('/') for u in urls if u})
+    logging.info("Total unique field links gathered: %s", len(deduped))
+    return deduped
+
 def infer_field(record: Dict[str, object]) -> Field:
     external_id = str(record.get("id") or record.get("uuid") or record.get("_id"))
     name = str(record.get("name") or "").strip()
@@ -555,7 +612,7 @@ def infer_field(record: Dict[str, object]) -> Field:
     )
     latitude = record.get("lat") or record.get("latitude")
     longitude = record.get("lng") or record.get("longitude")
-    if not external_id or not name or not address:
+    if not external_id or not name:
         raise ValueError("Listing record missing required fields")
     return Field(
         external_id=external_id,
@@ -565,6 +622,23 @@ def infer_field(record: Dict[str, object]) -> Field:
         latitude=float(latitude) if latitude is not None else None,
         longitude=float(longitude) if longitude is not None else None,
     )
+
+
+def fetch_field_detail(client: HttpClient, url: str) -> Optional[Field]:
+    try:
+        html = client.get(url, referer=EXPLORE_URL, allow_statuses={403}).text
+    except Exception as exc:  # noqa: BLE001 - continue despite failures
+        logging.warning("Failed to load field page %s: %s", url, exc)
+        return None
+
+    record = _extract_field_from_page(url, html)
+    if not record:
+        logging.debug("Unable to parse field details from %s", url)
+        return None
+    try:
+        return infer_field(record)
+    except ValueError:
+        return None
 
 
 def wikipedia_search(client: HttpClient, title: str) -> Optional[Dict[str, object]]:
@@ -663,62 +737,20 @@ def enrich_with_wikipedia(client: HttpClient, field: Field) -> Field:
     )
 
 
-def iter_fields(client: HttpClient, start_page: int, page_size: int) -> Iterable[List[Dict[str, object]]]:
-    page = start_page
-    attempted_bootstrap = False
-    while True:
-        try:
-            batch = fetch_listing(client, page, page_size)
-        except Exception as exc:  # noqa: BLE001 - fail fast after repeated retries
-            logging.error("Failed to fetch listing page %s: %s", page, exc)
-            raise
-        if not batch:
-            if page == start_page and not attempted_bootstrap:
-                attempted_bootstrap = True
-                for source_name, bootstrap_fn in (
-                    ("explore bootstrap", bootstrap_from_explore),
-                    ("explore link crawl", lambda c: bootstrap_from_explore_links(c)),
-                    ("sitemap bootstrap", lambda c: bootstrap_from_sitemap(c)),
-                ):
-                    try:
-                        bootstrap = bootstrap_fn(client)
-                    except Exception as exc:  # noqa: BLE001 - keep trying other fallbacks
-                        logging.error("%s failed: %s", source_name.capitalize(), exc)
-                        bootstrap = []
-                    if bootstrap:
-                        logging.info(
-                            "Yielding %s data in %s-sized chunks",
-                            source_name,
-                            page_size,
-                        )
-                        for idx in range(0, len(bootstrap), page_size):
-                            yield bootstrap[idx : idx + page_size]
-                            page += 1
-                        break
-                else:
-                    break
-                break
-            break
-        yield batch
-        page += 1
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Scrape soccerfieldmap.com listings.")
+    parser = argparse.ArgumentParser(description="Scrape soccerfieldmap.com field pages directly to CSV.")
     parser.add_argument("--csv", type=Path, default=Path("data/fields.csv"), help="CSV output written incrementally")
     parser.add_argument(
         "--progress",
         type=Path,
         default=Path("data/progress.json"),
-        help="Progress checkpoint for resuming from the last completed page",
+        help="Progress checkpoint storing processed field links",
     )
-    parser.add_argument("--page-size", type=int, default=200)
     parser.add_argument("--wiki-workers", type=int, default=5, help="Parallel workers for Wikipedia enrichment")
     parser.add_argument("--max-attempts", type=int, default=6, help="HTTP retry attempts per request")
     parser.add_argument("--backoff", type=float, default=1.0, help="Initial backoff (seconds) for retries")
     parser.add_argument("--backoff-cap", type=float, default=20.0, help="Max backoff (seconds) for retries")
     parser.add_argument("--timeout", type=int, default=20, help="HTTP timeout per request")
-    parser.add_argument("--max-pages", type=int, default=None, help="Optional limit for listing pages")
     parser.add_argument("--log-level", default="INFO", help="Logging level (DEBUG, INFO, WARNING)")
     args = parser.parse_args()
 
@@ -729,8 +761,8 @@ def main() -> None:
     )
 
     args.csv.parent.mkdir(parents=True, exist_ok=True)
-    progress = ProgressTracker(args.progress)
     csv_sink = CsvSink(args.csv)
+    progress = ProgressTracker(args.progress, seed=csv_sink.existing_links)
     listing_client = HttpClient(
         DEFAULT_USER_AGENTS,
         max_attempts=args.max_attempts,
@@ -746,47 +778,50 @@ def main() -> None:
         backoff_cap=args.backoff_cap,
         timeout=args.timeout,
     )
-    processed = csv_sink.existing_links
-    start_page = progress.last_page()
+    processed = progress.processed
+
+    field_urls = collect_field_urls(listing_client)
+    if not field_urls:
+        logging.error("No field URLs discovered; nothing to do")
+        return
+
+    pending_urls = [u for u in field_urls if u not in processed]
+    logging.info("Processing %s new field pages (skipping %s already saved)", len(pending_urls), len(processed))
 
     try:
         with ThreadPoolExecutor(max_workers=args.wiki_workers) as executor:
-            for page_index, batch in enumerate(
-                iter_fields(listing_client, start_page, args.page_size), start=start_page
-            ):
-                pending: List[Field] = []
-                for record in batch:
-                    try:
-                        field = infer_field(record)
-                    except ValueError:
-                        logging.warning("Skipping malformed listing: %s", record)
-                        continue
-                    if field.url in processed:
-                        continue
-                    pending.append(field)
+            futures: Dict[object, Field] = {}
+            for url in pending_urls:
+                field = fetch_field_detail(listing_client, url)
+                if not field:
+                    progress.mark_link(url)
+                    continue
+                future = executor.submit(enrich_with_wikipedia, wiki_client, field)
+                futures[future] = field
 
-                futures = {
-                    executor.submit(enrich_with_wikipedia, wiki_client, field): field.external_id
-                    for field in pending
-                }
+                if len(futures) >= args.wiki_workers * 2:
+                    for finished in as_completed(list(futures)):
+                        base_field = futures.pop(finished)
+                        try:
+                            enriched = finished.result()
+                        except Exception as exc:  # noqa: BLE001 - continue on worker failure
+                            logging.error("Wikipedia enrichment failed for %s: %s", base_field.url, exc)
+                            enriched = base_field
+                        csv_sink.append(enriched)
+                        progress.mark_link(enriched.url)
+                        break
 
-                for future in as_completed(futures):
-                    external_id = futures[future]
-                    try:
-                        enriched = future.result()
-                    except Exception as exc:  # noqa: BLE001 - continue on worker failure
-                        logging.error("Worker failed for %s: %s", external_id, exc)
-                        continue
-                    csv_sink.append(enriched)
-                    processed.add(enriched.url)
-
-                progress.mark_page(page_index + 1)
-
-                if args.max_pages is not None and (page_index + 1) >= (start_page + args.max_pages):
-                    logging.info("Reached max pages limit (%s), stopping.", args.max_pages)
-                    break
+            for finished in as_completed(list(futures)):
+                base_field = futures[finished]
+                try:
+                    enriched = finished.result()
+                except Exception as exc:  # noqa: BLE001 - continue on worker failure
+                    logging.error("Wikipedia enrichment failed for %s: %s", base_field.url, exc)
+                    enriched = base_field
+                csv_sink.append(enriched)
+                progress.mark_link(enriched.url)
     except KeyboardInterrupt:
-        logging.warning("Interrupted by user, progress preserved up to page %s", progress.last_page())
+        logging.warning("Interrupted by user, processed links preserved")
 
 
 if __name__ == "__main__":
